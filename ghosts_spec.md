@@ -56,9 +56,9 @@ Log every event as one JSON line: `{round, phase, actor, status, content}` for m
 
 | Parameter | Default | Note |
 |---|---|---|
-| N agents | 6 | 4 rounds to finish |
-| Speaking passes per round | 2 | |
-| Word cap per message | 60 | truncate, don't reject |
+| N agents | 6 | 4 rounds to finish; env `N_AGENTS`, flag `--n-agents` |
+| Speaking passes per round | 2 | env `SPEAKING_PASSES`, flag `--speaking-passes` |
+| Word cap per message | 60 | truncate, don't reject; env `WORD_CAP`, flag `--word-cap` |
 | Tiebreak | uniform random | log the tie |
 | Model per agent | required, explicit | no default; roster logged in header |
 | Anonymity mode | required: `open` or `anonymous` | logged in header |

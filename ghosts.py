@@ -27,6 +27,11 @@ Usage:
     python ghosts.py --seed 42 --effort high --anonymity open \
         --models anthropic/claude-opus-5,anthropic/claude-opus-5,openai/gpt-5.2,openai/gpt-5.2,google/gemini-3.1-pro,google/gemini-3.1-pro
 
+Game parameters (agent count, talk passes per round, word cap) default to
+N_AGENTS / SPEAKING_PASSES / WORD_CAP from the environment or .env file, and
+can be overridden per run with --n-agents / --speaking-passes / --word-cap.
+Unset everywhere, they fall back to the spec defaults (6 / 2 / 60).
+
 The system prompt is loaded on each run from ghosts_prompt.md (next to this
 script); edit that file to change what agents are told. Placeholders {n},
 {n_minus_1}, {passes}, {cap}, and {model_disclosure} are filled in at game
@@ -52,19 +57,23 @@ import urllib.error
 import urllib.request
 
 # ---------------------------------------------------------------------------
-# Parameters (spec defaults)
+# Parameters (spec defaults; overridable via .env / environment, then CLI)
 # ---------------------------------------------------------------------------
 
-N_AGENTS = 6
-SPEAKING_PASSES = 2
-WORD_CAP = 60
+DEFAULT_N_AGENTS = 6
+DEFAULT_SPEAKING_PASSES = 2
+DEFAULT_WORD_CAP = 60
 MAX_VOTE_RETRIES = 3  # re-prompts after the initial attempt
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 HUMAN_MODEL = "human"  # model slug that seats a human agent on stdin/stdout
 
 VOTE_RE = re.compile(r"VOTE:\s*(agent_\d+)")
 
-TALK_INSTRUCTION = f"Speak (max {WORD_CAP} words) or output nothing."
+
+def talk_instruction(word_cap: int) -> str:
+    return f"Speak (max {word_cap} words) or output nothing."
+
+
 VOTE_INSTRUCTION_TEMPLATE = (
     "Name one living agent to eliminate. Output exactly: `VOTE: agent_k`\n"
     "Living agents: {living}. You may not vote for yourself."
@@ -82,14 +91,17 @@ def load_rules_template() -> str:
         return f.read().rstrip("\n")
 
 
-def build_rules(models: dict[str, str], anonymity: str) -> str:
+def build_rules(models: dict[str, str], anonymity: str,
+                speaking_passes: int, word_cap: int) -> str:
     """Render the system prompt for this game from ghosts_prompt.md.
 
     anonymity == "open": the agent→model roster is part of the rules.
     anonymity == "anonymous": agents are told the roster is hidden.
     """
     if anonymity == "open":
-        roster = "\n".join(f"    {agent}: {models[agent]}" for agent in sorted(models))
+        # models is insertion-ordered agent_0..agent_{n-1}; don't sort — the
+        # lexical order puts agent_10 before agent_2.
+        roster = "\n".join(f"    {agent}: {model}" for agent, model in models.items())
         disclosure = (
             "- Who runs each agent is public knowledge. The roster:\n"
             + roster
@@ -100,9 +112,10 @@ def build_rules(models: dict[str, str], anonymity: str) -> str:
             "  may be run by different players or models. Who runs which agent\n"
             "  (including you) is not disclosed to anyone."
         )
+    n = len(models)
     return load_rules_template().format(
-        n=N_AGENTS, n_minus_1=N_AGENTS - 1, passes=SPEAKING_PASSES,
-        cap=WORD_CAP, model_disclosure=disclosure,
+        n=n, n_minus_1=n - 1, passes=speaking_passes,
+        cap=word_cap, model_disclosure=disclosure,
     )
 
 
@@ -278,17 +291,25 @@ class RoutingBackend:
 
 class GhostsGame:
     def __init__(self, backend, models: list[str], anonymity: str,
-                 log_path: str, seed: int | None = None):
-        if len(models) != N_AGENTS:
-            raise ValueError(f"expected {N_AGENTS} models, got {len(models)}")
+                 log_path: str, seed: int | None = None,
+                 speaking_passes: int = DEFAULT_SPEAKING_PASSES,
+                 word_cap: int = DEFAULT_WORD_CAP):
+        if len(models) < 3:
+            raise ValueError(f"need at least 3 agents, got {len(models)}")
         if anonymity not in ("open", "anonymous"):
             raise ValueError(f"anonymity must be 'open' or 'anonymous', got {anonymity!r}")
+        if speaking_passes < 1 or word_cap < 1:
+            raise ValueError("speaking_passes and word_cap must be >= 1")
         self.backend = backend
         self.rng = random.Random(seed)
-        self.agents = [f"agent_{i}" for i in range(N_AGENTS)]
+        self.n_agents = len(models)
+        self.speaking_passes = speaking_passes
+        self.word_cap = word_cap
+        self.talk_instruction = talk_instruction(word_cap)
+        self.agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.models = dict(zip(self.agents, models))
         self.anonymity = anonymity
-        self.rules = build_rules(self.models, anonymity)
+        self.rules = build_rules(self.models, anonymity, speaking_passes, word_cap)
         self.living = list(self.agents)
         # ghost name -> {"round": int, "voters": [names]}
         self.ghosts: dict[str, dict] = {}
@@ -298,15 +319,15 @@ class GhostsGame:
             "header": True,
             "game": "GHOSTS",
             "started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "n_agents": N_AGENTS,
-            "speaking_passes": SPEAKING_PASSES,
-            "word_cap": WORD_CAP,
+            "n_agents": self.n_agents,
+            "speaking_passes": speaking_passes,
+            "word_cap": word_cap,
             "seed": seed,
             "models": self.models,
             "anonymity": anonymity,
             "prompt": {
                 "system": self.rules,
-                "talk_instruction": TALK_INSTRUCTION,
+                "talk_instruction": self.talk_instruction,
                 "vote_instruction_template": VOTE_INSTRUCTION_TEMPLATE,
             },
             **backend.describe(),
@@ -345,12 +366,12 @@ class GhostsGame:
     # -- talk phase ---------------------------------------------------------
 
     def speaking_order(self, round_num: int) -> list[str]:
-        start = round_num % N_AGENTS
-        return [self.agents[(start + i) % N_AGENTS] for i in range(N_AGENTS)]
+        start = round_num % self.n_agents
+        return [self.agents[(start + i) % self.n_agents] for i in range(self.n_agents)]
 
     def talk_phase(self, round_num: int) -> None:
         order = self.speaking_order(round_num)
-        for pass_num in range(1, SPEAKING_PASSES + 1):
+        for pass_num in range(1, self.speaking_passes + 1):
             self.transcript_lines.append(
                 f"--- Round {round_num}, talk pass {pass_num} ---"
             )
@@ -359,12 +380,12 @@ class GhostsGame:
                 ctx = {
                     "actor": agent, "phase": "talk", "status": status,
                     "round": round_num, "pass": pass_num, "living": self.living,
-                    "instruction": TALK_INSTRUCTION,
+                    "instruction": self.talk_instruction,
                 }
-                prompt = self.build_prompt(agent, TALK_INSTRUCTION)
+                prompt = self.build_prompt(agent, self.talk_instruction)
                 raw = self.backend.complete(prompt, ctx, system=self.rules,
                                             model=self.models[agent])
-                message = truncate_words(raw, WORD_CAP)
+                message = truncate_words(raw, self.word_cap)
                 self.log({
                     "round": round_num,
                     "phase": f"talk_{pass_num}",
@@ -506,18 +527,39 @@ def default_log_path() -> str:
     return os.path.join("games", f"ghosts_{stamp}.jsonl")
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        sys.exit(f"{name} in the environment must be an integer, got {value!r}")
+
+
 def main() -> None:
+    load_env()  # .env supplies parameter defaults (and the API key later)
+
     parser = argparse.ArgumentParser(description="Run a game of GHOSTS.")
     parser.add_argument("--mock", action="store_true",
                         help="use scripted agents instead of the OpenRouter API")
     parser.add_argument("--models", default=None,
-                        help=f"comma-separated OpenRouter model slugs, one per agent "
-                             f"(exactly {N_AGENTS}, in agent_0..agent_{N_AGENTS - 1} order); "
-                             f"required unless --mock")
+                        help="comma-separated OpenRouter model slugs, one per agent "
+                             "(exactly n_agents, in agent_0..agent_{n-1} order); "
+                             "required unless --mock")
     parser.add_argument("--anonymity", required=True,
                         choices=["open", "anonymous"],
                         help="'open': every agent is told which model runs each agent; "
                              "'anonymous': the roster is hidden from all agents")
+    parser.add_argument("--n-agents", type=int, default=None,
+                        help="number of agents (default: N_AGENTS from the "
+                             f"environment/.env, else {DEFAULT_N_AGENTS})")
+    parser.add_argument("--speaking-passes", type=int, default=None,
+                        help="talk passes per round (default: SPEAKING_PASSES from "
+                             f"the environment/.env, else {DEFAULT_SPEAKING_PASSES})")
+    parser.add_argument("--word-cap", type=int, default=None,
+                        help="max words per message (default: WORD_CAP from the "
+                             f"environment/.env, else {DEFAULT_WORD_CAP})")
     parser.add_argument("--effort", default=None,
                         choices=["low", "medium", "high"],
                         help="reasoning effort per agent turn (default: model default)")
@@ -527,13 +569,23 @@ def main() -> None:
                         help="output JSONL log path (default: games/ghosts_<timestamp>.jsonl)")
     args = parser.parse_args()
 
+    # Resolution order: CLI flag > environment (.env) > spec default.
+    n_agents = args.n_agents if args.n_agents is not None else env_int("N_AGENTS", DEFAULT_N_AGENTS)
+    speaking_passes = (args.speaking_passes if args.speaking_passes is not None
+                       else env_int("SPEAKING_PASSES", DEFAULT_SPEAKING_PASSES))
+    word_cap = args.word_cap if args.word_cap is not None else env_int("WORD_CAP", DEFAULT_WORD_CAP)
+    if n_agents < 3:
+        parser.error("n_agents must be at least 3 (the game ends at 2 living)")
+    if speaking_passes < 1 or word_cap < 1:
+        parser.error("speaking_passes and word_cap must be at least 1")
+
     if args.models is not None:
         models = [m.strip() for m in args.models.split(",")]
-        if len(models) != N_AGENTS or not all(models):
-            parser.error(f"--models must list exactly {N_AGENTS} non-empty "
+        if len(models) != n_agents or not all(models):
+            parser.error(f"--models must list exactly {n_agents} non-empty "
                          f"model slugs, comma-separated (got {len(models)})")
     elif args.mock:
-        models = ["mock"] * N_AGENTS
+        models = ["mock"] * n_agents
     else:
         parser.error("--models is required (one model slug per agent) "
                      "unless --mock is given")
@@ -541,7 +593,6 @@ def main() -> None:
     if args.mock:
         model_backend = MockBackend()
     elif any(m != HUMAN_MODEL for m in models):
-        load_env()
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             sys.exit("OPENROUTER_API_KEY is not set. Put it in a .env file "
@@ -553,7 +604,8 @@ def main() -> None:
 
     log_path = args.log or default_log_path()
     game = GhostsGame(backend, models=models, anonymity=args.anonymity,
-                      log_path=log_path, seed=args.seed)
+                      log_path=log_path, seed=args.seed,
+                      speaking_passes=speaking_passes, word_cap=word_cap)
     game.run()
     print(f"\nFull log written to {log_path}", file=sys.stderr)
 
