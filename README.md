@@ -1,4 +1,4 @@
-# GHOSTS
+# SquidGPT
 
 A an elimination death game for AI and human agents, plus tooling to run batches
 of games and analyze how models behave. The goal is to probe coalition behavior,
