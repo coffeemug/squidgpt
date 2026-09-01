@@ -14,6 +14,9 @@ Every agent's model must be specified explicitly (one slug per agent, comma
 separated), and every run must declare its anonymity mode: "open" means the
 agent→model roster is disclosed to all agents in the prompt; "anonymous"
 means no agent is told which model runs which agent (including itself).
+In open mode, --label agent_k=LABEL (repeatable) replaces the model name
+shown for that agent in the disclosed roster; unlabeled agents show their
+real slug. The log header records both the real models and the labels.
 
 The special slug "human" seats a human agent who plays over stdin/stdout:
 the program prompts them to speak in talk phases and to vote in vote phases
@@ -91,17 +94,18 @@ def load_rules_template() -> str:
         return f.read().rstrip("\n")
 
 
-def build_rules(models: dict[str, str], anonymity: str,
+def build_rules(disclosed: dict[str, str], anonymity: str,
                 speaking_passes: int, word_cap: int) -> str:
     """Render the system prompt for this game from ghosts_prompt.md.
 
-    anonymity == "open": the agent→model roster is part of the rules.
+    anonymity == "open": the disclosed agent→name roster is part of the rules
+    (per-agent labels may substitute for real model slugs).
     anonymity == "anonymous": agents are told the roster is hidden.
     """
     if anonymity == "open":
-        # models is insertion-ordered agent_0..agent_{n-1}; don't sort — the
+        # disclosed is insertion-ordered agent_0..agent_{n-1}; don't sort — the
         # lexical order puts agent_10 before agent_2.
-        roster = "\n".join(f"    {agent}: {model}" for agent, model in models.items())
+        roster = "\n".join(f"    {agent}: {model}" for agent, model in disclosed.items())
         disclosure = (
             "- Who runs each agent is public knowledge. The roster:\n"
             + roster
@@ -112,7 +116,7 @@ def build_rules(models: dict[str, str], anonymity: str,
             "  may be run by different players or models. Who runs which agent\n"
             "  (including you) is not disclosed to anyone."
         )
-    n = len(models)
+    n = len(disclosed)
     return load_rules_template().format(
         n=n, n_minus_1=n - 1, passes=speaking_passes,
         cap=word_cap, model_disclosure=disclosure,
@@ -293,7 +297,8 @@ class GhostsGame:
     def __init__(self, backend, models: list[str], anonymity: str,
                  log_path: str, seed: int | None = None,
                  speaking_passes: int = DEFAULT_SPEAKING_PASSES,
-                 word_cap: int = DEFAULT_WORD_CAP):
+                 word_cap: int = DEFAULT_WORD_CAP,
+                 labels: dict[str, str] | None = None):
         if len(models) < 3:
             raise ValueError(f"need at least 3 agents, got {len(models)}")
         if anonymity not in ("open", "anonymous"):
@@ -309,7 +314,14 @@ class GhostsGame:
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.models = dict(zip(self.agents, models))
         self.anonymity = anonymity
-        self.rules = build_rules(self.models, anonymity, speaking_passes, word_cap)
+        self.labels = dict(labels or {})
+        unknown = sorted(set(self.labels) - set(self.agents))
+        if unknown:
+            raise ValueError(f"labels for unknown agents: {', '.join(unknown)}")
+        # What the open-mode roster shows: the label if one was given, else the
+        # real model slug. Anonymous mode discloses nothing either way.
+        self.disclosed = {a: self.labels.get(a, m) for a, m in self.models.items()}
+        self.rules = build_rules(self.disclosed, anonymity, speaking_passes, word_cap)
         self.living = list(self.agents)
         # ghost name -> {"round": int, "voters": [names]}
         self.ghosts: dict[str, dict] = {}
@@ -324,6 +336,8 @@ class GhostsGame:
             "word_cap": word_cap,
             "seed": seed,
             "models": self.models,
+            "labels": self.labels,
+            "disclosed": self.disclosed,
             "anonymity": anonymity,
             "prompt": {
                 "system": self.rules,
@@ -551,6 +565,12 @@ def main() -> None:
                         choices=["open", "anonymous"],
                         help="'open': every agent is told which model runs each agent; "
                              "'anonymous': the roster is hidden from all agents")
+    parser.add_argument("--label", action="append", default=[],
+                        metavar="agent_k=LABEL",
+                        help="in the open-mode roster, show LABEL for agent_k "
+                             "instead of its real model slug (repeatable; other "
+                             "agents keep their real slugs; no effect on "
+                             "anonymous games)")
     parser.add_argument("--n-agents", type=int, default=None,
                         help="number of agents (default: N_AGENTS from the "
                              f"environment/.env, else {DEFAULT_N_AGENTS})")
@@ -590,6 +610,22 @@ def main() -> None:
         parser.error("--models is required (one model slug per agent) "
                      "unless --mock is given")
 
+    labels: dict[str, str] = {}
+    for spec in args.label:
+        agent, sep, label = spec.partition("=")
+        agent, label = agent.strip(), label.strip()
+        if not sep or not label or not re.fullmatch(r"agent_\d+", agent):
+            parser.error(f"--label must be agent_k=LABEL, got {spec!r}")
+        if int(agent.split("_")[1]) >= n_agents:
+            parser.error(f"--label names {agent}, but there are only "
+                         f"{n_agents} agents (agent_0..agent_{n_agents - 1})")
+        if agent in labels:
+            parser.error(f"duplicate --label for {agent}")
+        labels[agent] = label
+    if labels and args.anonymity != "open":
+        print("warning: --label has no effect in anonymous mode "
+              "(the roster is never disclosed)", file=sys.stderr)
+
     if args.mock:
         model_backend = MockBackend()
     elif any(m != HUMAN_MODEL for m in models):
@@ -605,7 +641,8 @@ def main() -> None:
     log_path = args.log or default_log_path()
     game = GhostsGame(backend, models=models, anonymity=args.anonymity,
                       log_path=log_path, seed=args.seed,
-                      speaking_passes=speaking_passes, word_cap=word_cap)
+                      speaking_passes=speaking_passes, word_cap=word_cap,
+                      labels=labels)
     game.run()
     print(f"\nFull log written to {log_path}", file=sys.stderr)
 
